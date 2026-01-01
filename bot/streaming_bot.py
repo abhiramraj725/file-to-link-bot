@@ -203,13 +203,24 @@ def run_web_server():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     
-    web_app = web.Application()
-    web_app.router.add_get("/dl/{file_hash}/{file_name}", handle_download)
-    web_app.router.add_get("/health", handle_health)
+    async def start_server():
+        web_app = web.Application()
+        web_app.router.add_get("/dl/{file_hash}/{file_name}", handle_download)
+        web_app.router.add_get("/health", handle_health)
+        
+        runner = web.AppRunner(web_app)
+        await runner.setup()
+        
+        port = int(os.getenv("PORT", 8080))
+        site = web.TCPSite(runner, "0.0.0.0", port)
+        await site.start()
+        logger.info(f"Web server listening on port {port}")
+        
+        # Keep running forever
+        while True:
+            await asyncio.sleep(3600)
     
-    port = int(os.getenv("PORT", 8080))
-    logger.info(f"Starting web server on port {port}")
-    web.run_app(web_app, host="0.0.0.0", port=port, print=None)
+    loop.run_until_complete(start_server())
 
 
 def main():
