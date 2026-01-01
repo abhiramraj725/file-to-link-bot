@@ -252,10 +252,22 @@ def main():
     web_thread.start()
     print("🌐 Web server started in background")
     
-    # Run the bot (blocking)
+    # Run the bot with FloodWait handling
     print("✅ Bot is starting...")
-    app.run()
+    while True:
+        try:
+            app.run()
+            break
+        except Exception as e:
+            if "FloodWait" in str(type(e).__name__) or "FLOOD_WAIT" in str(e):
+                wait_time = getattr(e, 'value', 60) if hasattr(e, 'value') else 60
+                logger.warning(f"FloodWait: Waiting {wait_time} seconds before retry...")
+                time.sleep(wait_time + 5)
+            else:
+                logger.error(f"Error: {e}")
+                raise
 
 
 if __name__ == "__main__":
     main()
+
