@@ -179,13 +179,9 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
             "Content-Disposition": f'attachment; filename="{file_name}"',
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",  # Disable nginx buffering
         }
     )
     
-    # Optimize TCP for streaming
-    response.enable_chunked_encoding()
     await response.prepare(request)
     
     try:
