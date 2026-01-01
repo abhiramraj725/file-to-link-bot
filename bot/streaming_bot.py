@@ -228,27 +228,26 @@ async def start_web_server():
 async def main():
     """Start both bot and web server."""
     print("🚀 Starting File-to-Link Bot (Streaming Mode)...")
+    logger.info("Starting bot initialization...")
     
-    # Create sessions directory
-    os.makedirs("sessions", exist_ok=True)
-    
-    # Start web server
+    # Start web server first
     runner = await start_web_server()
     
     # Start bot
     await app.start()
-    print("✅ Bot is running! Press Ctrl+C to stop.")
+    me = await app.get_me()
+    logger.info(f"Bot started as @{me.username} (ID: {me.id})")
+    print(f"✅ Bot is running as @{me.username}! Press Ctrl+C to stop.")
     
-    # Keep running
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        await app.stop()
-        await runner.cleanup()
+    # Use pyrogram's idle to properly handle updates
+    from pyrogram import idle
+    await idle()
+    
+    # Cleanup on shutdown
+    await app.stop()
+    await runner.cleanup()
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
