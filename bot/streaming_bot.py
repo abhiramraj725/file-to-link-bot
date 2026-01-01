@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import time
 import logging
+import threading
 from urllib.parse import quote
 
 # Enable logging
@@ -25,20 +26,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from aiohttp import web
 from pyrogram import Client, filters
 from pyrogram.types import Message
+from pyrogram.handlers import MessageHandler
 
 from config import config
 
 # Store file info: {file_hash: {file_id, file_name, file_size, access_hash, ...}}
 file_cache = {}
 
-# Bot client - use in_memory to avoid session conflicts
-app = Client(
-    name="file_to_link_bot",
-    api_id=config.API_ID,
-    api_hash=config.API_HASH,
-    bot_token=config.BOT_TOKEN,
-    in_memory=True,  # Don't save session to disk
-)
+# Bot client will be initialized later
+app = None
 
 
 def generate_file_hash(file_id: str) -> str:
@@ -57,16 +53,9 @@ def format_size(size_bytes: int) -> str:
 
 # ============== Telegram Bot Handlers ==============
 
-# Debug: catch all messages (group -1 runs first, doesn't block others)
-@app.on_message(group=-1)
-async def debug_all_messages(client: Client, message: Message):
-    """Log all incoming messages for debugging."""
-    logger.info(f"Received message from {message.from_user.id if message.from_user else 'unknown'}: {message.text or message.media or 'Unknown'}")
-
-
-@app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
     """Handle /start command."""
+    logger.info(f"Received /start from {message.from_user.id}")
     welcome_text = """
 🔗 **File-to-Link Bot**
 
@@ -82,9 +71,9 @@ Just send me a file to get started!
     await message.reply_text(welcome_text.strip())
 
 
-@app.on_message(filters.command("help"))
 async def help_command(client: Client, message: Message):
     """Handle /help command."""
+    logger.info(f"Received /help from {message.from_user.id}")
     help_text = """
 📖 **Help**
 
@@ -97,9 +86,9 @@ async def help_command(client: Client, message: Message):
     await message.reply_text(help_text.strip())
 
 
-@app.on_message(filters.document | filters.video | filters.audio | filters.voice | filters.video_note | filters.photo)
 async def handle_file(client: Client, message: Message):
     """Handle incoming files - generate instant download link."""
+    logger.info(f"Received file from {message.from_user.id}")
     
     # Get file info based on message type
     if message.document:
@@ -170,6 +159,7 @@ async def handle_file(client: Client, message: Message):
 
 async def handle_download(request: web.Request) -> web.StreamResponse:
     """Handle file download requests - stream directly from Telegram."""
+    global app
     file_hash = request.match_info.get("file_hash")
     
     if file_hash not in file_cache:
@@ -198,7 +188,7 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
         async for chunk in app.stream_media(file_id):
             await response.write(chunk)
     except Exception as e:
-        print(f"Streaming error: {e}")
+        logger.error(f"Streaming error: {e}")
     
     return response
 
@@ -208,46 +198,53 @@ async def handle_health(request: web.Request) -> web.Response:
     return web.Response(text="OK")
 
 
-async def start_web_server():
-    """Start the web server for file streaming."""
+def run_web_server():
+    """Run the web server in a separate thread."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
     web_app = web.Application()
     web_app.router.add_get("/dl/{file_hash}/{file_name}", handle_download)
     web_app.router.add_get("/health", handle_health)
     
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    
     port = int(os.getenv("PORT", 8080))
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    logger.info(f"Starting web server on port {port}")
+    web.run_app(web_app, host="0.0.0.0", port=port, print=None)
+
+
+def main():
+    """Start the bot."""
+    global app
     
-    print(f"🌐 Web server running on port {port}")
-    return runner
-
-
-async def main():
-    """Start both bot and web server."""
     print("🚀 Starting File-to-Link Bot (Streaming Mode)...")
-    logger.info("Starting bot initialization...")
+    logger.info("Initializing bot...")
     
-    # Start web server first
-    runner = await start_web_server()
+    # Create bot client
+    app = Client(
+        name="file_to_link_bot",
+        api_id=config.API_ID,
+        api_hash=config.API_HASH,
+        bot_token=config.BOT_TOKEN,
+        in_memory=True,
+    )
     
-    # Start bot
-    await app.start()
-    me = await app.get_me()
-    logger.info(f"Bot started as @{me.username} (ID: {me.id})")
-    print(f"✅ Bot is running as @{me.username}! Press Ctrl+C to stop.")
+    # Register handlers
+    app.add_handler(MessageHandler(start_command, filters.command("start")))
+    app.add_handler(MessageHandler(help_command, filters.command("help")))
+    app.add_handler(MessageHandler(
+        handle_file,
+        filters.document | filters.video | filters.audio | filters.voice | filters.video_note | filters.photo
+    ))
     
-    # Use pyrogram's idle to properly handle updates
-    from pyrogram import idle
-    await idle()
+    # Start web server in background thread
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    print("🌐 Web server started in background")
     
-    # Cleanup on shutdown
-    await app.stop()
-    await runner.cleanup()
+    # Run the bot (blocking)
+    print("✅ Bot is starting...")
+    app.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
+    main()
