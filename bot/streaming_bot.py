@@ -10,7 +10,15 @@ import sys
 import asyncio
 import hashlib
 import time
+import logging
 from urllib.parse import quote
+
+# Enable logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -48,6 +56,13 @@ def format_size(size_bytes: int) -> str:
 
 
 # ============== Telegram Bot Handlers ==============
+
+# Debug: catch all messages (group -1 runs first, doesn't block others)
+@app.on_message(group=-1)
+async def debug_all_messages(client: Client, message: Message):
+    """Log all incoming messages for debugging."""
+    logger.info(f"Received message from {message.from_user.id if message.from_user else 'unknown'}: {message.text or message.media or 'Unknown'}")
+
 
 @app.on_message(filters.command("start"))
 async def start_command(client: Client, message: Message):
