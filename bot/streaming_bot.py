@@ -158,7 +158,7 @@ async def handle_file(client: Client, message: Message):
 # ============== Web Server for Streaming ==============
 
 async def handle_download(request: web.Request) -> web.StreamResponse:
-    """Handle file download requests - stream directly from Telegram."""
+    """Handle file download requests - stream directly from Telegram with optimized buffering."""
     global app
     file_hash = request.match_info.get("file_hash")
     
@@ -171,7 +171,7 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
     file_size = file_info["file_size"]
     mime_type = file_info["mime_type"]
     
-    # Create streaming response
+    # Create streaming response with optimized headers
     response = web.StreamResponse(
         status=200,
         headers={
@@ -179,14 +179,32 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
             "Content-Disposition": f'attachment; filename="{file_name}"',
             "Content-Length": str(file_size),
             "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # Disable nginx buffering
         }
     )
+    
+    # Optimize TCP for streaming
+    response.enable_chunked_encoding()
     await response.prepare(request)
     
     try:
-        # Stream file directly from Telegram
+        # Stream file directly from Telegram with optimized chunk size
+        # Pyrogram default is 1MB chunks which should be fast
+        buffer = bytearray()
+        buffer_size = 1024 * 1024  # 1MB buffer for faster writes
+        
         async for chunk in app.stream_media(file_id):
-            await response.write(chunk)
+            buffer.extend(chunk)
+            # Write when buffer is full
+            if len(buffer) >= buffer_size:
+                await response.write(bytes(buffer))
+                buffer.clear()
+        
+        # Write remaining data
+        if buffer:
+            await response.write(bytes(buffer))
+            
     except Exception as e:
         logger.error(f"Streaming error: {e}")
     
@@ -196,6 +214,7 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
     return web.Response(text="OK")
+
 
 
 def run_web_server():
