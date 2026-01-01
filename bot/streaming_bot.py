@@ -23,13 +23,13 @@ from config import config
 # Store file info: {file_hash: {file_id, file_name, file_size, access_hash, ...}}
 file_cache = {}
 
-# Bot client
+# Bot client - use in_memory to avoid session conflicts
 app = Client(
     name="file_to_link_bot",
     api_id=config.API_ID,
     api_hash=config.API_HASH,
     bot_token=config.BOT_TOKEN,
-    workdir="./sessions",
+    in_memory=True,  # Don't save session to disk
 )
 
 
