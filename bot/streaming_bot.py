@@ -64,6 +64,7 @@ Send me any file and get an **instant download link**!
 ✨ **Features:**
 • Instant link generation (no waiting!)
 • Supports files up to 4GB
+• Resume downloads supported
 • Links work as long as the bot is running
 
 Just send me a file to get started!
@@ -157,8 +158,28 @@ async def handle_file(client: Client, message: Message):
 
 # ============== Web Server for Streaming ==============
 
+def parse_range_header(range_header: str, file_size: int):
+    """Parse Range header and return start, end bytes."""
+    if not range_header or not range_header.startswith("bytes="):
+        return 0, file_size - 1
+    
+    range_spec = range_header[6:]  # Remove "bytes="
+    if "-" not in range_spec:
+        return 0, file_size - 1
+    
+    parts = range_spec.split("-")
+    start = int(parts[0]) if parts[0] else 0
+    end = int(parts[1]) if parts[1] else file_size - 1
+    
+    # Clamp values
+    start = max(0, min(start, file_size - 1))
+    end = max(start, min(end, file_size - 1))
+    
+    return start, end
+
+
 async def handle_download(request: web.Request) -> web.StreamResponse:
-    """Handle file download requests - stream directly from Telegram with optimized buffering."""
+    """Handle file download requests - stream directly from Telegram with range support."""
     global app
     file_hash = request.match_info.get("file_hash")
     
@@ -171,35 +192,47 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
     file_size = file_info["file_size"]
     mime_type = file_info["mime_type"]
     
-    # Create streaming response with optimized headers
-    response = web.StreamResponse(
-        status=200,
-        headers={
-            "Content-Type": mime_type,
-            "Content-Disposition": f'attachment; filename="{file_name}"',
-            "Content-Length": str(file_size),
-            "Accept-Ranges": "bytes",
-        }
-    )
+    # Parse Range header for resume support
+    range_header = request.headers.get("Range", "")
+    start, end = parse_range_header(range_header, file_size)
+    content_length = end - start + 1
     
+    # Determine if this is a partial content request
+    is_partial = bool(range_header)
+    status = 206 if is_partial else 200
+    
+    # Create streaming response with range support
+    headers = {
+        "Content-Type": mime_type,
+        "Content-Disposition": f'attachment; filename="{file_name}"',
+        "Content-Length": str(content_length),
+        "Accept-Ranges": "bytes",
+    }
+    
+    if is_partial:
+        headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+    
+    response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
     
     try:
-        # Stream file directly from Telegram with optimized chunk size
-        # Pyrogram default is 1MB chunks which should be fast
-        buffer = bytearray()
-        buffer_size = 1024 * 1024  # 1MB buffer for faster writes
+        # Stream file directly from Telegram with offset support
+        current_pos = 0
         
-        async for chunk in app.stream_media(file_id):
-            buffer.extend(chunk)
-            # Write when buffer is full
-            if len(buffer) >= buffer_size:
-                await response.write(bytes(buffer))
-                buffer.clear()
-        
-        # Write remaining data
-        if buffer:
-            await response.write(bytes(buffer))
+        async for chunk in app.stream_media(file_id, offset=start):
+            chunk_start = current_pos
+            chunk_end = current_pos + len(chunk)
+            
+            # Only write chunks within our range
+            if chunk_end > end - start + 1:
+                # Trim the last chunk
+                remaining = end - start + 1 - current_pos
+                if remaining > 0:
+                    await response.write(chunk[:remaining])
+                break
+            
+            await response.write(chunk)
+            current_pos = chunk_end
             
     except Exception as e:
         logger.error(f"Streaming error: {e}")
@@ -210,7 +243,6 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
 async def handle_health(request: web.Request) -> web.Response:
     """Health check endpoint."""
     return web.Response(text="OK")
-
 
 
 def run_web_server():
@@ -245,13 +277,15 @@ def main():
     print("🚀 Starting File-to-Link Bot (Streaming Mode)...")
     logger.info("Initializing bot...")
     
-    # Create bot client
+    # Create bot client with optimized settings
     app = Client(
         name="file_to_link_bot",
         api_id=config.API_ID,
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
         in_memory=True,
+        workers=16,  # More workers for parallel processing
+        max_concurrent_transmissions=8,  # Allow more concurrent downloads
     )
     
     # Register handlers
@@ -285,4 +319,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
