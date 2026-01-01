@@ -1,8 +1,8 @@
 """
-File-to-Link Telegram Bot with Streaming Proxy
+File-to-Link Telegram Bot with Server-Side Download
 
-This bot generates INSTANT download links by creating a streaming proxy server
-that serves files directly from Telegram's servers. No download/upload wait!
+This bot downloads files to the server first, then serves them as static files
+for fast download speeds. Files are cached on the server.
 """
 
 import os
@@ -13,6 +13,7 @@ import time
 import logging
 import threading
 from urllib.parse import quote
+from pathlib import Path
 
 # Enable logging
 logging.basicConfig(
@@ -30,8 +31,12 @@ from pyrogram.handlers import MessageHandler
 
 from config import config
 
-# Store file info: {file_hash: {file_id, file_name, file_size, access_hash, ...}}
+# Store file info: {file_hash: {file_id, file_name, file_size, local_path, ...}}
 file_cache = {}
+
+# Directory to store downloaded files
+DOWNLOAD_DIR = Path("/tmp/telegram_files")
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Bot client will be initialized later
 app = None
@@ -59,13 +64,13 @@ async def start_command(client: Client, message: Message):
     welcome_text = """
 🔗 **File-to-Link Bot**
 
-Send me any file and get an **instant download link**!
+Send me any file and get a **fast download link**!
 
 ✨ **Features:**
-• Instant link generation (no waiting!)
-• Supports files up to 4GB
+• Fast download speeds (files cached on server)
+• Supports files up to 2GB
 • Resume downloads supported
-• Links work as long as the bot is running
+• Links work as long as file is cached
 
 Just send me a file to get started!
     """
@@ -79,8 +84,9 @@ async def help_command(client: Client, message: Message):
 📖 **Help**
 
 • Send any file to get a download link
-• Links are generated instantly
-• Maximum file size: 4GB (Telegram Premium)
+• Small files: Instant link
+• Large files: Brief download wait, then fast link
+• Maximum file size: 2GB
 
 **Supported:** Documents, Videos, Audio, Photos
     """
@@ -88,7 +94,7 @@ async def help_command(client: Client, message: Message):
 
 
 async def handle_file(client: Client, message: Message):
-    """Handle incoming files - generate instant download link."""
+    """Handle incoming files - download to server and generate link."""
     logger.info(f"Received file from {message.from_user.id}")
     
     # Get file info based on message type
@@ -131,77 +137,110 @@ async def handle_file(client: Client, message: Message):
     else:
         return
     
-    # Generate hash and store file info
     file_hash = generate_file_hash(file_id)
-    file_cache[file_hash] = {
-        "file_id": file_id,
-        "file_name": file_name,
-        "file_size": file_size,
-        "mime_type": mime_type,
-        "created_at": time.time(),
-    }
-    
-    # Generate download URL
-    base_url = config.BASE_URL.rstrip("/")
-    encoded_name = quote(file_name)
-    download_url = f"{base_url}/dl/{file_hash}/{encoded_name}"
-    
     size_str = format_size(file_size)
     
-    await message.reply_text(
-        f"✅ **Link Generated!**\n\n"
+    # Check if already cached
+    if file_hash in file_cache and file_cache[file_hash].get("local_path"):
+        local_path = Path(file_cache[file_hash]["local_path"])
+        if local_path.exists():
+            base_url = config.BASE_URL.rstrip("/")
+            encoded_name = quote(file_name)
+            download_url = f"{base_url}/dl/{file_hash}/{encoded_name}"
+            
+            await message.reply_text(
+                f"✅ **Link Ready (Cached)!**\n\n"
+                f"📄 **File:** `{file_name}`\n"
+                f"📊 **Size:** {size_str}\n\n"
+                f"🔗 **Download Link:**\n{download_url}"
+            )
+            return
+    
+    # Send processing message
+    status_msg = await message.reply_text(
+        f"⏳ **Downloading to server...**\n\n"
         f"📄 **File:** `{file_name}`\n"
         f"📊 **Size:** {size_str}\n\n"
-        f"🔗 **Download Link:**\n{download_url}"
+        f"Please wait, this will only take a moment..."
     )
+    
+    try:
+        # Download file to server
+        local_path = DOWNLOAD_DIR / f"{file_hash}_{file_name}"
+        
+        # Use Pyrogram's download method for faster download
+        await client.download_media(
+            message,
+            file_name=str(local_path)
+        )
+        
+        # Store in cache
+        file_cache[file_hash] = {
+            "file_id": file_id,
+            "file_name": file_name,
+            "file_size": file_size,
+            "mime_type": mime_type,
+            "local_path": str(local_path),
+            "created_at": time.time(),
+        }
+        
+        # Generate download URL
+        base_url = config.BASE_URL.rstrip("/")
+        encoded_name = quote(file_name)
+        download_url = f"{base_url}/dl/{file_hash}/{encoded_name}"
+        
+        await status_msg.edit_text(
+            f"✅ **Link Generated!**\n\n"
+            f"📄 **File:** `{file_name}`\n"
+            f"📊 **Size:** {size_str}\n\n"
+            f"🔗 **Download Link:**\n{download_url}\n\n"
+            f"⚡ **Fast download from server!**"
+        )
+        
+    except Exception as e:
+        logger.error(f"Download error: {e}")
+        await status_msg.edit_text(
+            f"❌ **Download failed**\n\n"
+            f"Error: {str(e)}\n\n"
+            f"Please try again."
+        )
 
 
-# ============== Web Server for Streaming ==============
-
-def parse_range_header(range_header: str, file_size: int):
-    """Parse Range header and return start, end bytes."""
-    if not range_header or not range_header.startswith("bytes="):
-        return 0, file_size - 1
-    
-    range_spec = range_header[6:]  # Remove "bytes="
-    if "-" not in range_spec:
-        return 0, file_size - 1
-    
-    parts = range_spec.split("-")
-    start = int(parts[0]) if parts[0] else 0
-    end = int(parts[1]) if parts[1] else file_size - 1
-    
-    # Clamp values
-    start = max(0, min(start, file_size - 1))
-    end = max(start, min(end, file_size - 1))
-    
-    return start, end
-
+# ============== Web Server for File Serving ==============
 
 async def handle_download(request: web.Request) -> web.StreamResponse:
-    """Handle file download requests - stream directly from Telegram with range support."""
-    global app
+    """Handle file download requests - serve from local storage."""
     file_hash = request.match_info.get("file_hash")
     
     if file_hash not in file_cache:
         return web.Response(text="File not found or link expired", status=404)
     
     file_info = file_cache[file_hash]
-    file_id = file_info["file_id"]
+    local_path = Path(file_info.get("local_path", ""))
+    
+    if not local_path.exists():
+        return web.Response(text="File not found on server", status=404)
+    
     file_name = file_info["file_name"]
     file_size = file_info["file_size"]
     mime_type = file_info["mime_type"]
     
     # Parse Range header for resume support
     range_header = request.headers.get("Range", "")
-    start, end = parse_range_header(range_header, file_size)
-    content_length = end - start + 1
+    start = 0
+    end = file_size - 1
     
-    # Determine if this is a partial content request
+    if range_header and range_header.startswith("bytes="):
+        range_spec = range_header[6:]
+        if "-" in range_spec:
+            parts = range_spec.split("-")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else file_size - 1
+    
+    content_length = end - start + 1
     is_partial = bool(range_header)
     status = 206 if is_partial else 200
     
-    # Create streaming response with range support
     headers = {
         "Content-Type": mime_type,
         "Content-Disposition": f'attachment; filename="{file_name}"',
@@ -215,27 +254,23 @@ async def handle_download(request: web.Request) -> web.StreamResponse:
     response = web.StreamResponse(status=status, headers=headers)
     await response.prepare(request)
     
+    # Stream from local file (FAST!)
     try:
-        # Stream file directly from Telegram with offset support
-        current_pos = 0
-        
-        async for chunk in app.stream_media(file_id, offset=start):
-            chunk_start = current_pos
-            chunk_end = current_pos + len(chunk)
+        with open(local_path, "rb") as f:
+            f.seek(start)
+            remaining = content_length
+            chunk_size = 1024 * 1024  # 1MB chunks
             
-            # Only write chunks within our range
-            if chunk_end > end - start + 1:
-                # Trim the last chunk
-                remaining = end - start + 1 - current_pos
-                if remaining > 0:
-                    await response.write(chunk[:remaining])
-                break
-            
-            await response.write(chunk)
-            current_pos = chunk_end
-            
+            while remaining > 0:
+                read_size = min(chunk_size, remaining)
+                chunk = f.read(read_size)
+                if not chunk:
+                    break
+                await response.write(chunk)
+                remaining -= len(chunk)
+                
     except Exception as e:
-        logger.error(f"Streaming error: {e}")
+        logger.error(f"File serving error: {e}")
     
     return response
 
@@ -251,7 +286,7 @@ def run_web_server():
     asyncio.set_event_loop(loop)
     
     async def start_server():
-        web_app = web.Application()
+        web_app = web.Application(client_max_size=1024**3)  # 1GB max
         web_app.router.add_get("/dl/{file_hash}/{file_name}", handle_download)
         web_app.router.add_get("/health", handle_health)
         
@@ -274,7 +309,7 @@ def main():
     """Start the bot."""
     global app
     
-    print("🚀 Starting File-to-Link Bot (Streaming Mode)...")
+    print("🚀 Starting File-to-Link Bot (Server Download Mode)...")
     logger.info("Initializing bot...")
     
     # Create bot client with optimized settings
@@ -284,8 +319,8 @@ def main():
         api_hash=config.API_HASH,
         bot_token=config.BOT_TOKEN,
         in_memory=True,
-        workers=16,  # More workers for parallel processing
-        max_concurrent_transmissions=8,  # Allow more concurrent downloads
+        workers=16,
+        max_concurrent_transmissions=8,
     )
     
     # Register handlers
